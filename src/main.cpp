@@ -25,16 +25,15 @@ const float FULL_DISTANCE = SENSOR_OFFSET;                  // 2cm when full
 const int EMPTY_THRESHOLD = 20;    // Pump ON when below 20%
 const int FULL_THRESHOLD = 90;      // Pump OFF when above 90%
 
-// ============ IMPROVED ULTRASONIC VARIABLES ============
-const int NUM_SAMPLES = 7;           // More samples for better averaging
+// ============ FAST RESPONSE ULTRASONIC VARIABLES ============
+const int NUM_SAMPLES = 3;           // Only 3 samples for faster response
 float distanceSamples[NUM_SAMPLES];  // Array to store samples
 int sampleIndex = 0;                  // Current index
-float lastValidDistance = 22.0;       // Last valid reading (start with empty)
-int errorCount = 0;                    // Count consecutive errors
-const int MAX_ERRORS = 5;              // Allow more errors before giving up
-unsigned long lastSensorReadTime = 0;
-const unsigned long SENSOR_DELAY = 100; // Minimum delay between readings
-// =====================================================
+float lastValidDistance = 22.0;       // Last valid reading
+int consecutiveSameValue = 0;         // Count consecutive same readings
+float previousRawReading = 22.0;      // Previous raw reading for comparison
+const int STABILITY_THRESHOLD = 2;    // How many same readings to confirm change
+// ============================================================
 
 long duration;
 float distance;
@@ -48,20 +47,13 @@ bool pump2State = HIGH;
 // Function declarations
 void updateLCD();
 
-// ============ IMPROVED ULTRASONIC READING FUNCTION ============
+// ============ FAST RESPONSE ULTRASONIC READING ============
 float readUltrasonic() {
-  unsigned long currentTime = millis();
+  // Take 3 readings and use median (faster than averaging)
+  float readings[3];
+  int validCount = 0;
   
-  // Ensure minimum delay between readings
-  if (currentTime - lastSensorReadTime < SENSOR_DELAY) {
-    return lastValidDistance;
-  }
-  
-  // Take multiple readings quickly
-  float readings[5]; // Take 5 readings
-  int validReadings = 0;
-  
-  for(int i = 0; i < 5; i++) {
+  for(int i = 0; i < 3; i++) {
     // Trigger the sensor
     digitalWrite(TRIG, LOW);
     delayMicroseconds(2);
@@ -69,68 +61,74 @@ float readUltrasonic() {
     delayMicroseconds(10);
     digitalWrite(TRIG, LOW);
     
-    // Read with timeout (30ms = about 5m range)
-    duration = pulseIn(ECHO, HIGH, 30000);
+    // Read with shorter timeout (10ms = about 170cm range - plenty for your tank)
+    duration = pulseIn(ECHO, HIGH, 10000);
     
     if(duration > 0) {
       float tempDistance = duration * 0.034 / 2;
       
       // Check if reading is reasonable (between 2cm and 200cm)
       if(tempDistance >= 2 && tempDistance <= 200) {
-        readings[validReadings] = tempDistance;
-        validReadings++;
+        readings[validCount] = tempDistance;
+        validCount++;
       }
     }
     
-    // Small delay between readings
-    delayMicroseconds(500);
+    // Minimal delay between readings (faster!)
+    delayMicroseconds(200);
   }
   
-  lastSensorReadTime = currentTime;
-  
-  // If we have valid readings
-  if(validReadings > 0) {
-    errorCount = 0; // Reset error count
-    
-    // Calculate average of valid readings
-    float sum = 0;
-    for(int i = 0; i < validReadings; i++) {
-      sum += readings[i];
+  // If we have at least 2 valid readings
+  if(validCount >= 2) {
+    // Sort the valid readings
+    for(int i = 0; i < validCount-1; i++) {
+      for(int j = i+1; j < validCount; j++) {
+        if(readings[i] > readings[j]) {
+          float temp = readings[i];
+          readings[i] = readings[j];
+          readings[j] = temp;
+        }
+      }
     }
-    float avgReading = sum / validReadings;
     
-    // Add to running average
-    distanceSamples[sampleIndex] = avgReading;
+    // Use median (middle value) or average of middle two if even count
+    float currentReading;
+    if(validCount == 3) {
+      currentReading = readings[1];  // Median of 3
+    } else {
+      currentReading = (readings[0] + readings[1]) / 2.0;  // Average of 2
+    }
+    
+    // Check if reading is stable (same as previous)
+    if(abs(currentReading - previousRawReading) < 0.5) {
+      consecutiveSameValue++;
+    } else {
+      consecutiveSameValue = 0;
+    }
+    
+    previousRawReading = currentReading;
+    
+    // Update running average (simple and fast)
+    distanceSamples[sampleIndex] = currentReading;
     sampleIndex = (sampleIndex + 1) % NUM_SAMPLES;
     
-    // Calculate smooth average
-    float smoothSum = 0;
+    // Calculate current average
+    float sum = 0;
     for(int i = 0; i < NUM_SAMPLES; i++) {
-      smoothSum += distanceSamples[i];
+      sum += distanceSamples[i];
     }
-    float smoothReading = smoothSum / NUM_SAMPLES;
+    float avgReading = sum / NUM_SAMPLES;
     
-    // Only accept if change is reasonable (less than 10cm jump)
-    if(abs(smoothReading - lastValidDistance) < 10.0 || lastValidDistance == 22.0) {
-      lastValidDistance = smoothReading;
-      return smoothReading;
-    } else {
-      // Gradual change - move 20% toward new reading
-      lastValidDistance = lastValidDistance * 0.8 + smoothReading * 0.2;
-      return lastValidDistance;
-    }
-  } else {
-    // No valid readings
-    errorCount++;
-    
-    if(errorCount > MAX_ERRORS) {
-      Serial.println("Warning: Ultrasonic sensor not responding!");
-      // Return last valid distance but maybe indicate problem
-      return lastValidDistance;
+    // If reading is stable or change is significant, update immediately
+    if(consecutiveSameValue >= STABILITY_THRESHOLD || abs(avgReading - lastValidDistance) > 2.0) {
+      lastValidDistance = avgReading;
     }
     
-    return lastValidDistance; // Return last valid reading
+    return lastValidDistance;
   }
+  
+  // If not enough valid readings, return last valid
+  return lastValidDistance;
 }
 // ============================================================
 
@@ -157,14 +155,13 @@ void setup()
   BT.begin(9600);
   Serial.begin(9600);
 
-  // ============ INITIALIZE SAMPLE ARRAY ============
+  // Initialize sample array
   for(int i = 0; i < NUM_SAMPLES; i++) {
     distanceSamples[i] = EMPTY_DISTANCE;
   }
-  // =================================================
 
   lcd.setCursor(0,0);
-  lcd.print("WATER MONITOR v2");
+  lcd.print("WATER MONITOR v3");
   lcd.setCursor(0,1);
   lcd.print("Tank: 20cm");
   lcd.setCursor(0,2);
@@ -179,6 +176,10 @@ void setup()
 // ============ LOOP FUNCTION ============
 void loop()
 {
+  static unsigned long lastSensorRead = 0;
+  static unsigned long lastDisplayUpdate = 0;
+  static unsigned long lastSerialOutput = 0;
+  
   // Check Bluetooth connection
   if(btReady == false)
   {
@@ -194,48 +195,57 @@ void loop()
     return;
   }
 
-  // ============ GET ULTRASONIC READING ============
-  distance = readUltrasonic();
-  // =================================================
-  
-  // Constrain distance to valid range
-  if(distance < FULL_DISTANCE) distance = FULL_DISTANCE;
-  if(distance > EMPTY_DISTANCE) distance = EMPTY_DISTANCE;
-  
-  // Calculate water level percentage
-  waterLevelPercent = ((EMPTY_DISTANCE - distance) / TANK_HEIGHT) * 100.0;
-  waterLevelPercent = constrain(waterLevelPercent, 0, 100);
-  
-  // AUTO FILL CONTROL LOGIC
-  if(waterLevelPercent < EMPTY_THRESHOLD)
-  {
-    if(pump1State == HIGH) {
-      digitalWrite(PUMP1, LOW);
-      digitalWrite(LAMP1, HIGH);
-      pump1State = LOW;
-      Serial.println("PUMP1 AUTO ON - Tank low");
+  // Read ultrasonic sensor every 100ms for fast response
+  if(millis() - lastSensorRead >= 100) {
+    distance = readUltrasonic();
+    lastSensorRead = millis();
+    
+    // Constrain distance to valid range
+    if(distance < FULL_DISTANCE) distance = FULL_DISTANCE;
+    if(distance > EMPTY_DISTANCE) distance = EMPTY_DISTANCE;
+    
+    // Calculate water level percentage
+    waterLevelPercent = ((EMPTY_DISTANCE - distance) / TANK_HEIGHT) * 100.0;
+    waterLevelPercent = constrain(waterLevelPercent, 0, 100);
+    
+    // AUTO FILL CONTROL LOGIC - Check every reading for fast response
+    if(waterLevelPercent < EMPTY_THRESHOLD)
+    {
+      if(pump1State == HIGH) {
+        digitalWrite(PUMP1, LOW);
+        digitalWrite(LAMP1, HIGH);
+        pump1State = LOW;
+        Serial.println("PUMP1 AUTO ON - Tank low");
+      }
     }
-  }
-  else if(waterLevelPercent > FULL_THRESHOLD)
-  {
-    if(pump1State == LOW) {
-      digitalWrite(PUMP1, HIGH);
-      digitalWrite(LAMP1, LOW);
-      pump1State = HIGH;
-      Serial.println("PUMP1 AUTO OFF - Tank full");
-      BT.println("TANK FULL");
+    else if(waterLevelPercent > FULL_THRESHOLD)
+    {
+      if(pump1State == LOW) {
+        digitalWrite(PUMP1, HIGH);
+        digitalWrite(LAMP1, LOW);
+        pump1State = HIGH;
+        Serial.println("PUMP1 AUTO OFF - Tank full");
+        BT.println("TANK FULL");
+      }
     }
   }
 
-  // Read soil moisture
-  soilValue = analogRead(SOIL);
-  soilPercent = map(soilValue, 1023, 0, 0, 100);
-  soilPercent = constrain(soilPercent, 0, 100);
+  // Read soil moisture every 500ms (doesn't need to be fast)
+  static unsigned long lastSoilRead = 0;
+  if(millis() - lastSoilRead >= 500) {
+    soilValue = analogRead(SOIL);
+    soilPercent = map(soilValue, 1023, 0, 0, 100);
+    soilPercent = constrain(soilPercent, 0, 100);
+    lastSoilRead = millis();
+  }
 
-  // Update LCD Display
-  updateLCD();
+  // Update LCD every 200ms (smooth but not too fast)
+  if(millis() - lastDisplayUpdate >= 200) {
+    updateLCD();
+    lastDisplayUpdate = millis();
+  }
   
-  // Handle Bluetooth commands
+  // Handle Bluetooth commands immediately
   if(BT.available())
   {
     char cmd = BT.read();
@@ -271,11 +281,10 @@ void loop()
     }
   }
 
-  // Serial debugging
-  static unsigned long lastSerial = 0;
-  if(millis() - lastSerial > 2000) {
+  // Serial debugging every 1 second
+  if(millis() - lastSerialOutput > 1000) {
     Serial.println("=== SYSTEM STATUS ===");
-    Serial.print("Raw Distance: ");
+    Serial.print("Distance: ");
     Serial.print(distance);
     Serial.print(" cm, Water: ");
     Serial.print(waterLevelPercent, 1);
@@ -286,12 +295,8 @@ void loop()
     Serial.print(pump1State == LOW ? "ON" : "OFF");
     Serial.print(", Pump2: ");
     Serial.println(pump2State == LOW ? "ON" : "OFF");
-    Serial.print("Sensor errors: ");
-    Serial.println(errorCount);
-    lastSerial = millis();
+    lastSerialOutput = millis();
   }
-
-  delay(300);
 }
 
 // ============ UPDATE LCD FUNCTION ============
@@ -311,12 +316,14 @@ void updateLCD() {
   // Line 1: Water level percentage
   lcd.setCursor(0,1);
   lcd.print("LEVEL: ");
+  if(waterLevelPercent < 10) lcd.print(" ");
   lcd.print(waterLevelPercent, 1);
   lcd.print("%      ");
   
   // Line 2: Soil moisture
   lcd.setCursor(0,2);
   lcd.print("SOIL: ");
+  if(soilPercent < 10) lcd.print(" ");
   lcd.print(soilPercent);
   lcd.print("% ");
   if(soilPercent < 30)
@@ -332,5 +339,5 @@ void updateLCD() {
   lcd.print(pump1State == LOW ? "ON " : "OFF");
   lcd.print(" P2:");
   lcd.print(pump2State == LOW ? "ON " : "OFF");
-  lcd.print(" ");
+  // Removed the errorCount reference
 }
