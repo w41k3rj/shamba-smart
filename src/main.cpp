@@ -25,13 +25,15 @@ const float FULL_DISTANCE = SENSOR_OFFSET;                  // 2cm when full
 const int EMPTY_THRESHOLD = 20;    // Pump ON when below 20%
 const int FULL_THRESHOLD = 90;      // Pump OFF when above 90%
 
-// ============ ADDED FOR SMOOTH ULTRASONIC ============
-const int NUM_SAMPLES = 5;           // Number of samples for averaging
+// ============ IMPROVED ULTRASONIC VARIABLES ============
+const int NUM_SAMPLES = 7;           // More samples for better averaging
 float distanceSamples[NUM_SAMPLES];  // Array to store samples
 int sampleIndex = 0;                  // Current index
 float lastValidDistance = 22.0;       // Last valid reading (start with empty)
 int errorCount = 0;                    // Count consecutive errors
-const int MAX_ERRORS = 3;              // Max errors before using last value
+const int MAX_ERRORS = 5;              // Allow more errors before giving up
+unsigned long lastSensorReadTime = 0;
+const unsigned long SENSOR_DELAY = 100; // Minimum delay between readings
 // =====================================================
 
 long duration;
@@ -45,6 +47,92 @@ bool pump2State = HIGH;
 
 // Function declarations
 void updateLCD();
+
+// ============ IMPROVED ULTRASONIC READING FUNCTION ============
+float readUltrasonic() {
+  unsigned long currentTime = millis();
+  
+  // Ensure minimum delay between readings
+  if (currentTime - lastSensorReadTime < SENSOR_DELAY) {
+    return lastValidDistance;
+  }
+  
+  // Take multiple readings quickly
+  float readings[5]; // Take 5 readings
+  int validReadings = 0;
+  
+  for(int i = 0; i < 5; i++) {
+    // Trigger the sensor
+    digitalWrite(TRIG, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG, LOW);
+    
+    // Read with timeout (30ms = about 5m range)
+    duration = pulseIn(ECHO, HIGH, 30000);
+    
+    if(duration > 0) {
+      float tempDistance = duration * 0.034 / 2;
+      
+      // Check if reading is reasonable (between 2cm and 200cm)
+      if(tempDistance >= 2 && tempDistance <= 200) {
+        readings[validReadings] = tempDistance;
+        validReadings++;
+      }
+    }
+    
+    // Small delay between readings
+    delayMicroseconds(500);
+  }
+  
+  lastSensorReadTime = currentTime;
+  
+  // If we have valid readings
+  if(validReadings > 0) {
+    errorCount = 0; // Reset error count
+    
+    // Calculate average of valid readings
+    float sum = 0;
+    for(int i = 0; i < validReadings; i++) {
+      sum += readings[i];
+    }
+    float avgReading = sum / validReadings;
+    
+    // Add to running average
+    distanceSamples[sampleIndex] = avgReading;
+    sampleIndex = (sampleIndex + 1) % NUM_SAMPLES;
+    
+    // Calculate smooth average
+    float smoothSum = 0;
+    for(int i = 0; i < NUM_SAMPLES; i++) {
+      smoothSum += distanceSamples[i];
+    }
+    float smoothReading = smoothSum / NUM_SAMPLES;
+    
+    // Only accept if change is reasonable (less than 10cm jump)
+    if(abs(smoothReading - lastValidDistance) < 10.0 || lastValidDistance == 22.0) {
+      lastValidDistance = smoothReading;
+      return smoothReading;
+    } else {
+      // Gradual change - move 20% toward new reading
+      lastValidDistance = lastValidDistance * 0.8 + smoothReading * 0.2;
+      return lastValidDistance;
+    }
+  } else {
+    // No valid readings
+    errorCount++;
+    
+    if(errorCount > MAX_ERRORS) {
+      Serial.println("Warning: Ultrasonic sensor not responding!");
+      // Return last valid distance but maybe indicate problem
+      return lastValidDistance;
+    }
+    
+    return lastValidDistance; // Return last valid reading
+  }
+}
+// ============================================================
 
 // ============ SETUP FUNCTION ============
 void setup()
@@ -88,73 +176,6 @@ void setup()
   lcd.print("WAIT BLUETOOTH");
 }
 
-// ============ NEW FUNCTION FOR SMOOTH ULTRASONIC ============
-float readSmoothUltrasonic() {
-  float rawReadings[3];  // Take 3 quick samples
-  
-  // Take 3 samples in quick succession
-  for(int i = 0; i < 3; i++) {
-    digitalWrite(TRIG, LOW);
-    delayMicroseconds(2);
-    digitalWrite(TRIG, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(TRIG, LOW);
-    
-    duration = pulseIn(ECHO, HIGH, 30000);
-    
-    if(duration == 0) {
-      rawReadings[i] = lastValidDistance;  // Use last valid on error
-      errorCount++;
-    } else {
-      rawReadings[i] = duration * 0.034 / 2;
-      errorCount = 0;
-    }
-    delayMicroseconds(500);  // Small delay between samples
-  }
-  
-  // If too many errors, return last valid
-  if(errorCount > MAX_ERRORS) {
-    Serial.println("Sensor unstable - using last valid");
-    return lastValidDistance;
-  }
-  
-  // Sort the 3 readings to find median
-  float temp;
-  for(int i = 0; i < 2; i++) {
-    for(int j = i+1; j < 3; j++) {
-      if(rawReadings[i] > rawReadings[j]) {
-        temp = rawReadings[i];
-        rawReadings[i] = rawReadings[j];
-        rawReadings[j] = temp;
-      }
-    }
-  }
-  
-  float medianReading = rawReadings[1];  // Middle value
-  
-  // Add to running average
-  distanceSamples[sampleIndex] = medianReading;
-  sampleIndex = (sampleIndex + 1) % NUM_SAMPLES;
-  
-  // Calculate average
-  float sum = 0;
-  for(int i = 0; i < NUM_SAMPLES; i++) {
-    sum += distanceSamples[i];
-  }
-  float smoothReading = sum / NUM_SAMPLES;
-  
-  // Only accept readings that make sense (not jumping more than 5cm)
-  if(abs(smoothReading - lastValidDistance) < 5.0 || lastValidDistance == 22.0) {
-    lastValidDistance = smoothReading;
-    return smoothReading;
-  } else {
-    // If jump is too big, use last valid
-    Serial.println("Large jump detected - filtered");
-    return lastValidDistance;
-  }
-}
-// ============================================================
-
 // ============ LOOP FUNCTION ============
 void loop()
 {
@@ -173,9 +194,9 @@ void loop()
     return;
   }
 
-  // ============ REPLACED WITH SMOOTH READING ============
-  distance = readSmoothUltrasonic();
-  // ======================================================
+  // ============ GET ULTRASONIC READING ============
+  distance = readUltrasonic();
+  // =================================================
   
   // Constrain distance to valid range
   if(distance < FULL_DISTANCE) distance = FULL_DISTANCE;
@@ -252,9 +273,9 @@ void loop()
 
   // Serial debugging
   static unsigned long lastSerial = 0;
-  if(millis() - lastSerial > 1000) {  // Changed to 1 second for more frequent debug
+  if(millis() - lastSerial > 2000) {
     Serial.println("=== SYSTEM STATUS ===");
-    Serial.print("Distance: ");
+    Serial.print("Raw Distance: ");
     Serial.print(distance);
     Serial.print(" cm, Water: ");
     Serial.print(waterLevelPercent, 1);
@@ -265,13 +286,15 @@ void loop()
     Serial.print(pump1State == LOW ? "ON" : "OFF");
     Serial.print(", Pump2: ");
     Serial.println(pump2State == LOW ? "ON" : "OFF");
+    Serial.print("Sensor errors: ");
+    Serial.println(errorCount);
     lastSerial = millis();
   }
 
-  delay(300);  // Reduced from 500ms to 300ms for smoother updates
+  delay(300);
 }
 
-// ============ UPDATE LCD FUNCTION (YOUR ORIGINAL CODE) ============
+// ============ UPDATE LCD FUNCTION ============
 void updateLCD() {
   // Line 0: Tank status
   lcd.setCursor(0,0);
